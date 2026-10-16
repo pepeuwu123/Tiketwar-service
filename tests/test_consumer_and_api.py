@@ -1,0 +1,96 @@
+"""End-to-end-ish: a scraper payload must land in Postgres exactly once and be readable via the API."""
+import json
+import time
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app import consumer, db as dbmod
+from app.db import Base
+from app.models import Event
+
+@pytest.fixture
+def session(monkeypatch):
+    # StaticPool keeps ONE connection, so the TestClient thread and this session see
+    # the same in-memory database. Without it, :memory: is per-connection and the API
+    # reads an empty schema while the test writes into a different one.
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    S = sessionmaker(bind=engine, expire_on_commit=False)
+    # db.py is lazy on purpose: no psycopg needed for a SQLite test.
+    monkeypatch.setattr(dbmod, "get_engine", lambda: engine)
+    monkeypatch.setattr(dbmod, "_SessionLocal", S)
+    with S() as s:
+        yield s
+
+def payload(**kw):
+    return {"type": "check", "ts": 1700000000.0, "state": {"seats": 5, "available": True, **kw}}
+
+def test_event_is_persisted(session, monkeypatch):
+    monkeypatch.setattr(consumer.alerts, "on_event", lambda db, ev: None)
+    consumer.handle(session, None, "1-0", payload())
+    row = session.execute(select(Event)).scalars().one()
+    assert row.seats == 5 and row.available is True and row.type == "check"
+
+def test_replayed_stream_id_is_not_duplicated(session, monkeypatch):
+    """Streams redeliver. A duplicate row would double-count yield in the daily report."""
+    monkeypatch.setattr(consumer.alerts, "on_event", lambda db, ev: None)
+    consumer.handle(session, None, "1-0", payload())
+    consumer.handle(session, None, "1-0", payload(seats=9))
+    rows = session.execute(select(Event)).scalars().all()
+    assert len(rows) == 1 and rows[0].seats == 5
+
+def test_unknown_seats_survive_as_null_not_zero(session, monkeypatch):
+    """If unknown collapsed to 0 it would be indistinguishable from sold out."""
+    monkeypatch.setattr(consumer.alerts, "on_event", lambda db, ev: None)
+    consumer.handle(session, None, "2-0", {"type": "check", "ts": 1.0, "state": {"seats": None}})
+    row = session.execute(select(Event)).scalars().one()
+    assert row.seats is None
+
+def test_healthz_reports_dead_scraper_when_heartbeat_missing(session):
+    from app import api
+    client = TestClient(api.app)
+    body = client.get("/healthz").json()
+    assert body["status"] == "degraded"
+    assert body["scraper_alive"] is False
+
+def test_summary_flags_broken_selectors(session):
+    """Unknown seat counts are the fingerprint of rotted selectors, and must be visible in the summary.
+
+    Timestamps are relative to now on purpose: a hardcoded epoch silently falls
+    outside the summary window and the test passes for the wrong reason.
+    """
+    from app import api
+    client = TestClient(api.app)
+    now = time.time()
+    for i in range(4):
+        consumer.handle(session, None, f"{i}-0", {"type": "check", "ts": now,
+                                                  "state": {"seats": None, "available": False}})
+    body = client.get("/api/summary?days=7").json()
+    assert body["checks_with_unknown_seats"] == 4
+    assert body["selectors_probably_broken"] is True
+
+def test_summary_does_not_flag_selectors_when_seats_are_readable(session):
+    from app import api
+    client = TestClient(api.app)
+    now = time.time()
+    for i in range(4):
+        consumer.handle(session, None, f"ok-{i}-0", {"type": "check", "ts": now,
+                                                     "state": {"seats": 3, "available": True}})
+    body = client.get("/api/summary?days=7").json()
+    assert body["checks_with_unknown_seats"] == 0
+    assert body["selectors_probably_broken"] is False
+    assert body["yield_ratio"] == 1.0
+
+def test_summary_rejects_absurd_windows(session):
+    """Guards the daily report against asking for a nonsense range."""
+    from app import api
+    client = TestClient(api.app)
+    assert client.get("/api/summary?days=36500").status_code == 422
