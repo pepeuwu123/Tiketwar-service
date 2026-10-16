@@ -94,3 +94,33 @@ def test_summary_rejects_absurd_windows(session):
     from app import api
     client = TestClient(api.app)
     assert client.get("/api/summary?days=36500").status_code == 422
+
+
+def test_healthz_distinguishes_alive_but_failing_from_dead(session, monkeypatch):
+    """A rotted selector must NOT look like a dead scraper.
+
+    Both used to be reported as DEAD, which sends you to debug the wrong
+    component. Now: heartbeat present = loop alive; last_poll_ok = site healthy.
+    """
+    import fakeredis
+    from app import api, events
+
+    r = fakeredis.FakeRedis(decode_responses=True)
+    r.set("tiketwar:heartbeat", json.dumps({"ts": time.time(), "ok": False, "state": None}))
+    monkeypatch.setattr(events, "connect", lambda _s=None: r)
+
+    body = TestClient(api.app).get("/healthz").json()
+    assert body["scraper_alive"] is True, "the loop is running"
+    assert body["last_poll_ok"] is False, "but the last poll failed - different problem"
+
+def test_healthz_reports_healthy_poll_separately(session, monkeypatch):
+    import fakeredis
+    from app import api, events
+
+    r = fakeredis.FakeRedis(decode_responses=True)
+    r.set("tiketwar:heartbeat", json.dumps({"ts": time.time(), "ok": True, "state": {"seats": 1}}))
+    monkeypatch.setattr(events, "connect", lambda _s=None: r)
+
+    body = TestClient(api.app).get("/healthz").json()
+    assert body["scraper_alive"] is True and body["last_poll_ok"] is True
+    assert body["status"] == "ok"
