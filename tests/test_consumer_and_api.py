@@ -165,3 +165,33 @@ def test_consume_once_survives_a_malformed_message(session, monkeypatch):
     monkeypatch.setattr(r, "xack", lambda *a, **kw: 1)
     n = consumer.consume_once(r, session_factory=lambda: session.__class__(bind=session.get_bind()))
     assert n == 0
+
+def test_stranded_messages_are_reclaimed(session, monkeypatch):
+    """A message held by a consumer that died must not be lost forever.
+
+    Redis keeps delivered-but-unacked messages pending. If the consumer dies first
+    they stay pending indefinitely - in the stream, invisible in Postgres. Observed
+    for real: 10 events stranded by a crash-looping consumer (dead consumer id in
+    XPENDING), a permanent gap between XLEN and the row count.
+    """
+    from app import consumer
+
+    payload = {"type": "check", "ts": time.time(), "state": {"seats": 4, "available": True}}
+    fake = type("R", (), {})()
+    fake.xautoclaim = lambda *a, **kw: ["0-0", [("7-0", {"payload": json.dumps(payload)})]]
+    acked = []
+    fake.xack = lambda *a, **kw: acked.append(a[2])
+    monkeypatch.setattr(consumer.alerts, "on_event", lambda db, ev: None)
+
+    n = consumer.reclaim_stale(fake, min_idle_ms=0)
+    assert n == 1
+    assert acked == ["7-0"], "a reclaimed message must be acked or it stays pending forever"
+
+def test_reclaim_survives_missing_xautoclaim(session, monkeypatch, caplog):
+    """Redis older than 6.2 has no XAUTOCLAIM; the consumer must still start."""
+    from app import consumer
+    fake = type("R", (), {})()
+    def boom(*a, **kw):
+        raise AttributeError("no such method")
+    fake.xautoclaim = boom
+    assert consumer.reclaim_stale(fake, min_idle_ms=0) == 0

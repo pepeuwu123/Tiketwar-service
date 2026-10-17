@@ -22,6 +22,44 @@ def ensure_group(r) -> None:
         if "BUSYGROUP" not in str(exc):
             raise
 
+def reclaim_stale(r, min_idle_ms: int = 60000) -> int:
+    """Take back messages that a dead consumer was holding.
+
+    Redis keeps a Pending Entries List: a message delivered to consumer A stays
+    pending until A acks it. If A dies first (crash, redeploy, OOM), that message is
+    stuck forever - readable in the stream, never written to Postgres, and invisible
+    on the dashboard. Observed for real: 10 events stranded by a crash-looping
+    consumer. XAUTOCLAIM also increments the delivery count, so a message that keeps
+    killing consumers is visible rather than silently retried forever.
+    """
+    claimed = 0
+    start = "0-0"
+    while True:
+        try:
+            resp = r.xautoclaim(settings.stream_key, settings.consumer_group,
+                                settings.consumer_name, min_idle_time=min_idle_ms,
+                                start_id=start, count=100)
+        except Exception as exc:                      # noqa: BLE001 - redis < 6.2
+            log.warning("XAUTOCLAIM unavailable (%s); stranded messages stay pending", exc)
+            return claimed
+        start, messages = resp[0], resp[1]
+        if not messages:
+            break
+        claimed += len(messages)
+        with db.SessionLocal() as session:
+            for stream_id, fields in messages:
+                try:
+                    handle(session, r, stream_id, json.loads(fields["payload"]))
+                    r.xack(settings.stream_key, settings.consumer_group, stream_id)
+                except Exception:                     # noqa: BLE001
+                    log.exception("could not reclaim %s", stream_id)
+                    session.rollback()
+        if start in ("0-0", "0-0-0", None):
+            break
+    if claimed:
+        log.info("reclaimed %d stranded message(s)", claimed)
+    return claimed
+
 def handle(db_session, redis_client, stream_id: str, payload: dict) -> None:
     state = payload.get("state") or {}
     ev = Event(
@@ -90,10 +128,16 @@ def main() -> None:
     db.init_db()
     r = events.connect(settings)
     ensure_group(r)
+    reclaim_stale(r)
     log.info("consumer %s up on %s", settings.consumer_name, settings.stream_key)
+    last_reclaim = time.monotonic()
     while True:
         try:
             consume_once(r)
+            # Heal again periodically: a consumer can die between startups too.
+            if time.monotonic() - last_reclaim > 300:
+                reclaim_stale(r)
+                last_reclaim = time.monotonic()
         except Exception as exc:                   # noqa: BLE001
             log.warning("consumer loop error (%s); retrying in 2s", exc)
             time.sleep(2)
