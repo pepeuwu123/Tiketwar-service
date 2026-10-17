@@ -5,7 +5,9 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  # Docker requires lowercase repository names, and the GitHub repos are
+  # named Tiketwar-* with a capital T, so github.repository cannot be used.
+  IMAGE: ghcr.io/pepeuwu123/tiketwar-service
 
 jobs:
   test:
