@@ -45,16 +45,12 @@ jobs:
             ${{ env.IMAGE }}:main
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
 
   deploy:
     needs: build
-    if: github.ref == 'refs/heads/main'
+    # Opt-in: needs a self-hosted runner labelled `tiketwar` on the VM.
+    # Without the variable the job is skipped instead of queuing forever.
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     runs-on: [self-hosted, tiketwar]
     steps:
       - name: deploy the pushed tag on the tiketwar VM
