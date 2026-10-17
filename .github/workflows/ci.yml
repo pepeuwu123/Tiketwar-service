@@ -53,11 +53,60 @@ jobs:
     if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     runs-on: [self-hosted, tiketwar]
     steps:
-      - name: deploy the pushed tag on the tiketwar VM
+      - name: update the compose checkout
+        # Previously this pulled images but never updated the compose file, so the VM
+        # would run NEW images against a STALE config. /opt/tiketwar is a git checkout
+        # for exactly this reason. Untracked files (.env) are preserved.
         working-directory: /opt/tiketwar
         run: |
-          echo "${{ env.IMAGE }}:${{ needs.build.outputs.tag }}" > .deployed-tag
-          docker compose pull || true
-          docker compose up -d --remove-orphans
-          docker compose ps
+          set -eu
+          git fetch --depth=1 origin main
+          git reset --hard origin/main
+          git log --oneline -1
+
+      - name: registry login
+        working-directory: /opt/tiketwar
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -eu
+          if [ -n "${GHCR_TOKEN}" ]; then
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          else
+            echo "::warning::GHCR_TOKEN is not set; pulling private images will fail"
+          fi
+
+      - name: deploy Tiketwar-service and verify it
+        working-directory: /opt/tiketwar
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          IMAGE: ${{ env.IMAGE }}
+        run: |
+          set -eu
+          # Debian ships compose two ways. 'docker compose' is the v2 plugin
+          # (docker-compose-v2); 'docker-compose' is the standalone binary. Using the
+          # wrong one fails with "docker: unknown command", so detect instead of assume.
+          if docker compose version >/dev/null 2>&1; then DC="docker compose"
+          elif command -v docker-compose >/dev/null 2>&1; then DC="docker-compose"
+          else
+            echo "::error::no compose found - apt install docker-compose-v2"
+            exit 1
+          fi
+          echo "using: $DC"
+
+          echo "$IMAGE:$TAG" > .deployed-tag
+          # No '|| true': a failed pull must fail the deploy. Swallowing it would
+          # leave the OLD image running and call it a success.
+          $DC pull
+          # --wait blocks until every healthcheck passes rather than returning as
+          # soon as containers are created.
+          $DC up -d --remove-orphans --wait --wait-timeout 180
+          $DC ps
+
           curl -fsS --retry 10 --retry-delay 3 http://localhost:8080/healthz
+
+          # Prove the container is running the image we just built, not a leftover.
+          got=$(docker inspect --format '{{.Config.Image}}' "$($DC ps -q service)")
+          echo "want: $IMAGE:$TAG"
+          echo "got:  $got"
+          [ "$got" = "$IMAGE:$TAG" ] || { echo "::error::running image does not match the pushed tag"; exit 1; }
