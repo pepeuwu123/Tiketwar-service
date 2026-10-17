@@ -1,12 +1,13 @@
 """Redis Streams -> Postgres -> alert rules. Runs as its own process beside the API."""
 import json
 import logging
-import socket
 import time
 from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+
+import redis as redis_lib
 
 from . import alerts, db, events
 from .config import settings
@@ -42,27 +43,60 @@ def handle(db_session, redis_client, stream_id: str, payload: dict) -> None:
         return                                        # already handled - streams redeliver
     alerts.on_event(db_session, ev)
 
+_last_hb_check = 0.0
+
+def consume_once(r, session_factory=None) -> int:
+    """One blocking read and dispatch. Returns how many messages were handled.
+
+    A blocking XREADGROUP raising TimeoutError is NORMAL: it means the block elapsed
+    with no message. Letting that kill the process made the consumer crash-loop
+    (21 restarts in one session) - and a consumer that dies whenever the queue is
+    quiet is worse than no consumer, because events pile up while it restarts.
+    """
+    global _last_hb_check
+    session_factory = session_factory or db.SessionLocal
+
+    try:
+        resp = r.xreadgroup(settings.consumer_group, settings.consumer_name,
+                            {settings.stream_key: ">"}, count=50, block=5000)
+    except redis_lib.exceptions.TimeoutError:
+        return 0                                   # idle, not broken
+
+    handled = 0
+    with session_factory() as session:
+        for _stream, messages in resp or []:
+            for stream_id, fields in messages:
+                try:
+                    payload = json.loads(fields["payload"])
+                    handle(session, r, stream_id, payload)
+                    r.xack(settings.stream_key, settings.consumer_group, stream_id)
+                    handled += 1
+                except Exception:                  # noqa: BLE001
+                    # One malformed message must not take down the consumer.
+                    log.exception("failed to handle %s; leaving it unacked", stream_id)
+                    session.rollback()
+
+        now = time.monotonic()
+        if now - _last_hb_check > 30:
+            try:
+                alerts.check_heartbeat(session, r)
+            except Exception:                      # noqa: BLE001
+                log.exception("heartbeat check failed")
+            _last_hb_check = now
+    return handled
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     db.init_db()
     r = events.connect(settings)
     ensure_group(r)
     log.info("consumer %s up on %s", settings.consumer_name, settings.stream_key)
-    last_hb_check = 0.0
     while True:
-        resp = r.xreadgroup(settings.consumer_group, settings.consumer_name,
-                            {settings.stream_key: ">"}, count=50, block=5000)
-        with db.SessionLocal() as session:
-            for _stream, messages in resp or []:
-                for stream_id, fields in messages:
-                    payload = json.loads(fields["payload"])
-                    handle(session, r, stream_id, payload)
-                    r.xack(settings.stream_key, settings.consumer_group, stream_id)
-
-            now = time.monotonic()
-            if now - last_hb_check > 30:
-                alerts.check_heartbeat(session, r)
-                last_hb_check = now
+        try:
+            consume_once(r)
+        except Exception as exc:                   # noqa: BLE001
+            log.warning("consumer loop error (%s); retrying in 2s", exc)
+            time.sleep(2)
 
 if __name__ == "__main__":
     main()

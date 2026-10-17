@@ -124,3 +124,44 @@ def test_healthz_reports_healthy_poll_separately(session, monkeypatch):
     body = TestClient(api.app).get("/healthz").json()
     assert body["scraper_alive"] is True and body["last_poll_ok"] is True
     assert body["status"] == "ok"
+
+def test_consume_once_survives_an_idle_timeout(session, monkeypatch):
+    """A blocking XREADGROUP with no messages raises TimeoutError. That is idle, not broken.
+
+    Letting it escape made the consumer crash-loop: 21 restarts observed in one run,
+    and every restart window means events are not being consumed.
+    """
+    import fakeredis
+    from app import consumer
+
+    r = fakeredis.FakeRedis(decode_responses=True)
+    import redis as redis_lib
+    def raise_timeout(*a, **kw):
+        raise redis_lib.exceptions.TimeoutError("timed out")
+    monkeypatch.setattr(r, "xreadgroup", raise_timeout)
+    assert consumer.consume_once(r, session_factory=lambda: session.__class__(bind=session.get_bind())) == 0
+
+def test_consume_once_dispatches_messages(session, monkeypatch):
+    import fakeredis
+    from app import consumer
+
+    r = fakeredis.FakeRedis(decode_responses=True)
+    payload = {"type": "check", "ts": time.time(), "state": {"seats": 2, "available": True}}
+    monkeypatch.setattr(r, "xreadgroup",
+                        lambda *a, **kw: [("tiketwar:events", [("9-0", {"payload": json.dumps(payload)})])])
+    monkeypatch.setattr(r, "xack", lambda *a, **kw: 1)
+    monkeypatch.setattr(consumer.alerts, "on_event", lambda db, ev: None)
+    n = consumer.consume_once(r, session_factory=lambda: session.__class__(bind=session.get_bind()))
+    assert n == 1
+
+def test_consume_once_survives_a_malformed_message(session, monkeypatch):
+    """One bad payload must not kill the loop and strand every later message."""
+    import fakeredis
+    from app import consumer
+
+    r = fakeredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(r, "xreadgroup",
+                        lambda *a, **kw: [("tiketwar:events", [("9-0", {"payload": "not json"})])])
+    monkeypatch.setattr(r, "xack", lambda *a, **kw: 1)
+    n = consumer.consume_once(r, session_factory=lambda: session.__class__(bind=session.get_bind()))
+    assert n == 0
