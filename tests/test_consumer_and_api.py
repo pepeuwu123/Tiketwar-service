@@ -166,6 +166,41 @@ def test_consume_once_survives_a_malformed_message(session, monkeypatch):
     n = consumer.consume_once(r, session_factory=lambda: session.__class__(bind=session.get_bind()))
     assert n == 0
 
+def test_idle_stream_still_checks_the_heartbeat(session, monkeypatch):
+    """Found on the live stack: with the scraper stopped, the consumer never said DEAD.
+
+    A dead scraper means an idle stream, an idle read raises TimeoutError, and
+    consume_once returned before reaching the heartbeat check - so the alert was
+    skipped exactly when it was needed.
+    """
+    import fakeredis
+    import redis as redis_lib
+    from app import consumer
+
+    r = fakeredis.FakeRedis(decode_responses=True)          # no heartbeat key: scraper dead
+    def raise_timeout(*a, **kw):
+        raise redis_lib.exceptions.TimeoutError("timed out")
+    monkeypatch.setattr(r, "xreadgroup", raise_timeout)
+    monkeypatch.setattr(consumer, "_last_hb_check", 0.0)
+    sent = []
+    monkeypatch.setattr(consumer.alerts.notify, "send", lambda t, b: sent.append(t) or True)
+    consumer.consume_once(r, session_factory=lambda: session.__class__(bind=session.get_bind()))
+    assert sent == ["Tiketwar: scraper is DEAD"]
+
+def test_malformed_message_is_acked_not_retried_forever(session):
+    """Retrying cannot fix bad JSON. Unacked, it was re-claimed and re-logged every
+    reclaim pass for the life of the stream."""
+    import fakeredis
+    from app import consumer
+    from app.config import settings
+
+    r = fakeredis.FakeRedis(decode_responses=True)
+    consumer.ensure_group(r)
+    r.xadd(settings.stream_key, {"payload": "{not json"})
+    r.xadd(settings.stream_key, {"payload": "[1, 2]"})
+    consumer.consume_once(r, session_factory=lambda: session.__class__(bind=session.get_bind()))
+    assert r.xpending(settings.stream_key, settings.consumer_group)["pending"] == 0
+
 def test_stranded_messages_are_reclaimed(session, monkeypatch):
     """A message held by a consumer that died must not be lost forever.
 

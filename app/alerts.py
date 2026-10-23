@@ -50,14 +50,33 @@ def on_event(db, event) -> None:
         # Informational only, and rate-limited hard: this is the normal "sold out" state.
         pass
 
+# Set while the scraper is known dead. Lives in redis next to the heartbeat so a
+# consumer restart mid-outage neither re-sends DEAD nor forgets to send RECOVERED.
+DEAD_FLAG_KEY = "tiketwar:alert:scraper_dead"
+
 def check_heartbeat(db, redis_client) -> None:
-    """The failure a plain ping test can't see: box up, scraper silent."""
+    """The failure a plain ping test can't see: box up, scraper silent.
+
+    Fires on transitions only, like the watchdog: alive -> dead sends DEAD once,
+    dead -> alive sends RECOVERED once. It used to be a cooldown equal to
+    dead_after_seconds, which re-sent DEAD every ~2.5 minutes for as long as the
+    outage lasted (24 messages in an hour) and never said when it was over.
+    """
     from .config import settings
 
-    if redis_client.exists(settings.heartbeat_key):
-        return
-    if not _already_sent(db, "dead_scraper", "heartbeat_missing", settings.dead_after_seconds):
+    alive = bool(redis_client.exists(settings.heartbeat_key))
+    flagged = bool(redis_client.exists(DEAD_FLAG_KEY))
+    if not alive and not flagged:
+        redis_client.set(DEAD_FLAG_KEY, "1")
+        db.add(Alert(kind="dead_scraper", fingerprint="heartbeat_missing"))
+        db.commit()
         notify.send("Tiketwar: scraper is DEAD",
                     f"No heartbeat for {settings.dead_after_seconds}s. "
                     "The container is probably up but the loop is not running. "
                     "This is the silent-failure mode - check logs.")
+    elif alive and flagged:
+        redis_client.delete(DEAD_FLAG_KEY)
+        db.add(Alert(kind="scraper_recovered", fingerprint="heartbeat_back"))
+        db.commit()
+        notify.send("Tiketwar: scraper RECOVERED",
+                    "The heartbeat is back. Check the dashboard for anything missed while it was down.")

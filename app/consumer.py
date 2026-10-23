@@ -48,8 +48,11 @@ def reclaim_stale(r, min_idle_ms: int = 60000) -> int:
         claimed += len(messages)
         with db.SessionLocal() as session:
             for stream_id, fields in messages:
+                payload = decode(r, stream_id, fields)
+                if payload is None:
+                    continue
                 try:
-                    handle(session, r, stream_id, json.loads(fields["payload"]))
+                    handle(session, r, stream_id, payload)
                     r.xack(settings.stream_key, settings.consumer_group, stream_id)
                 except Exception:                     # noqa: BLE001
                     log.exception("could not reclaim %s", stream_id)
@@ -59,6 +62,23 @@ def reclaim_stale(r, min_idle_ms: int = 60000) -> int:
     if claimed:
         log.info("reclaimed %d stranded message(s)", claimed)
     return claimed
+
+def decode(r, stream_id: str, fields) -> dict | None:
+    """Parse a stream entry, or ack-and-drop it if it can never be parsed.
+
+    Retrying cannot fix malformed JSON. Left unacked, such a message was re-claimed
+    by every reclaim_stale pass and logged as a fresh traceback every 5 minutes,
+    forever. Dropping it is safe: the raw entry is still in the stream for inspection.
+    """
+    try:
+        payload = json.loads(fields["payload"])
+        if not isinstance(payload, dict):
+            raise TypeError(f"payload is {type(payload).__name__}, not an object")
+        return payload
+    except (KeyError, TypeError, ValueError) as exc:
+        log.error("dropping malformed message %s (%s: %s)", stream_id, type(exc).__name__, exc)
+        r.xack(settings.stream_key, settings.consumer_group, stream_id)
+        return None
 
 def handle(db_session, redis_client, stream_id: str, payload: dict) -> None:
     state = payload.get("state") or {}
@@ -98,19 +118,25 @@ def consume_once(r, session_factory=None) -> int:
         resp = r.xreadgroup(settings.consumer_group, settings.consumer_name,
                             {settings.stream_key: ">"}, count=50, block=5000)
     except redis_lib.exceptions.TimeoutError:
-        return 0                                   # idle, not broken
+        # Idle, not broken - but fall through to the heartbeat check below. This used
+        # to `return 0` here, and the stream goes idle precisely when the scraper dies,
+        # so the DEAD alert was skipped in the one situation it exists for.
+        resp = None
 
     handled = 0
     with session_factory() as session:
         for _stream, messages in resp or []:
             for stream_id, fields in messages:
+                payload = decode(r, stream_id, fields)
+                if payload is None:
+                    continue
                 try:
-                    payload = json.loads(fields["payload"])
                     handle(session, r, stream_id, payload)
                     r.xack(settings.stream_key, settings.consumer_group, stream_id)
                     handled += 1
                 except Exception:                  # noqa: BLE001
-                    # One malformed message must not take down the consumer.
+                    # A well-formed message that failed (DB down, say) stays unacked
+                    # so reclaim_stale retries it. It must not take down the consumer.
                     log.exception("failed to handle %s; leaving it unacked", stream_id)
                     session.rollback()
 

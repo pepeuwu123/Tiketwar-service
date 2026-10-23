@@ -96,24 +96,22 @@ def list_events(limit: int = Query(100, le=1000), since_minutes: int | None = No
 def summary(days: int = Query(7, le=90)):
     """The numbers the daily report reads. Yield decay shows up here, not in a log."""
     since = datetime.now(timezone.utc) - timedelta(days=days)
+    is_check = Event.type == "check"
+    # One pass over the window instead of seven. The dashboard calls this every 10s
+    # per open tab, and at one event per 5s a week is ~120k rows per scan.
     with SessionLocal() as s:
-        total = s.execute(select(func.count()).select_from(Event).where(Event.ts >= since)).scalar_one()
-        checks = s.execute(select(func.count()).select_from(Event)
-                           .where(Event.ts >= since, Event.type == "check")).scalar_one()
-        errors = s.execute(select(func.count()).select_from(Event)
-                           .where(Event.ts >= since, Event.type == "poll_error")).scalar_one()
-        blocked = s.execute(select(func.count()).select_from(Event)
-                            .where(Event.ts >= since, Event.blocked.is_(True))).scalar_one()
-        grabbed = s.execute(select(func.count()).select_from(Event)
-                            .where(Event.ts >= since, Event.type == "add_to_cart",
-                                   Event.ok.is_(True))).scalar_one()
-        # "saw stock at least once" - the yield proxy
-        saw_stock = s.execute(select(func.count()).select_from(Event)
-                              .where(Event.ts >= since, Event.type == "check",
-                                     Event.available.is_(True))).scalar_one()
-        unknown = s.execute(select(func.count()).select_from(Event)
-                            .where(Event.ts >= since, Event.type == "check",
-                                   Event.seats.is_(None))).scalar_one()
+        (total, checks, errors, blocked, grabbed, saw_stock, unknown) = s.execute(
+            select(
+                func.count(),
+                func.count().filter(is_check),
+                func.count().filter(Event.type == "poll_error"),
+                func.count().filter(Event.blocked.is_(True)),
+                func.count().filter(Event.type == "add_to_cart", Event.ok.is_(True)),
+                # "saw stock at least once" - the yield proxy
+                func.count().filter(is_check, Event.available.is_(True)),
+                func.count().filter(is_check, Event.seats.is_(None)),
+            ).select_from(Event).where(Event.ts >= since)
+        ).one()
     return {
         "window_days": days,
         "events_total": total, "checks": checks, "poll_errors": errors,

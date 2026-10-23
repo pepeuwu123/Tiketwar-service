@@ -60,3 +60,14 @@ def test_live_heartbeat_is_silent(db, sent):
     r.set("tiketwar:heartbeat", '{"ts": 1}')
     alerts.check_heartbeat(db, r)
     assert sent == []
+
+def test_long_outage_sends_dead_once_then_recovered_once(db, sent):
+    """The check runs every 30s. With the old cooldown a one-hour outage sent DEAD
+    24 times and never said it was over - the pattern that gets a channel muted."""
+    r = fakeredis.FakeRedis(decode_responses=True)
+    for _ in range(120):                      # an hour of checks with no heartbeat
+        alerts.check_heartbeat(db, r)
+    r.set("tiketwar:heartbeat", '{"ts": 1}')
+    for _ in range(10):
+        alerts.check_heartbeat(db, r)
+    assert [t for t, _ in sent] == ["Tiketwar: scraper is DEAD", "Tiketwar: scraper RECOVERED"]
