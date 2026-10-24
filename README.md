@@ -14,12 +14,19 @@ Turns scraper events into history, state, and **one alert per real problem**.
 | Symptom | Meaning |
 |---|---|
 | `poll_error` | site changed / selectors rotted |
-| `blocked` | captcha / login wall / 429 — **needs a human, it will not retry harder** |
+| `blocked` | HTTP 403/429 or a captcha marker — **needs a human**; the scraper backs off instead of retrying harder |
 | heartbeat missing | container up but the loop is not running (the silent one) |
+
+Heartbeat alerts fire on transitions only: one DEAD when it goes missing, one
+RECOVERED when it comes back.
 
 ## Run it
 ```sh
 pip install -e '.[dev]'
+pytest
 uvicorn app.api:app --reload --port 8080   # API
 python -m app.consumer                     # consumer
 ```
+Settings come from environment variables only (see `.env.example`). The defaults
+point at the compose hostnames `postgres` and `redis`, so outside the
+`Tiketwar-infra` stack set `DATABASE_URL` and `REDIS_URL` first.
