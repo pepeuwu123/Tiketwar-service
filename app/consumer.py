@@ -2,9 +2,9 @@
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
 import redis as redis_lib
@@ -103,6 +103,29 @@ def handle(db_session, redis_client, stream_id: str, payload: dict) -> None:
 
 _last_hb_check = 0.0
 
+def beat(r) -> None:
+    """The consumer's own heartbeat. Nothing watched this process before: if it died,
+    /healthz still said "ok" and the dashboard quietly stopped getting new events."""
+    r.set(settings.consumer_heartbeat_key, json.dumps({"ts": time.time()}),
+          ex=max(10, settings.dead_after_seconds))
+
+def prune_old(session, days: int, batch: int = 5000) -> int:
+    """Delete events older than `days`, in batches so one run never holds a long lock.
+
+    At one event per 5s the table grew by ~6M rows a year with nothing reading the
+    old ones: /api/summary never looks back more than 90 days.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    deleted = 0
+    while True:
+        ids = session.execute(select(Event.id).where(Event.ts < cutoff).limit(batch)).scalars().all()
+        if not ids:
+            break
+        session.execute(delete(Event).where(Event.id.in_(ids)))
+        session.commit()
+        deleted += len(ids)
+    return deleted
+
 def consume_once(r, session_factory=None) -> int:
     """One blocking read and dispatch. Returns how many messages were handled.
 
@@ -123,6 +146,7 @@ def consume_once(r, session_factory=None) -> int:
         # so the DEAD alert was skipped in the one situation it exists for.
         resp = None
 
+    beat(r)
     handled = 0
     with session_factory() as session:
         for _stream, messages in resp or []:
@@ -157,6 +181,9 @@ def main() -> None:
     reclaim_stale(r)
     log.info("consumer %s up on %s", settings.consumer_name, settings.stream_key)
     last_reclaim = time.monotonic()
+    # None, not 0.0: monotonic() counts from boot, so "0.0 means long ago" is false on a
+    # freshly booted host and the first prune would wait for an hour of uptime.
+    last_prune: float | None = None
     while True:
         try:
             consume_once(r)
@@ -164,6 +191,12 @@ def main() -> None:
             if time.monotonic() - last_reclaim > 300:
                 reclaim_stale(r)
                 last_reclaim = time.monotonic()
+            if last_prune is None or time.monotonic() - last_prune > 3600:
+                last_prune = time.monotonic()
+                with db.SessionLocal() as session:
+                    n = prune_old(session, settings.retention_days)
+                if n:
+                    log.info("pruned %d event(s) older than %d days", n, settings.retention_days)
         except Exception as exc:                   # noqa: BLE001
             log.warning("consumer loop error (%s); retrying in 2s", exc)
             time.sleep(2)

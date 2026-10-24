@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     stream_key: str = "tiketwar:events"
     heartbeat_key: str = "tiketwar:heartbeat"
+    consumer_heartbeat_key: str = "tiketwar:consumer_heartbeat"
     consumer_group: str = "tiketwar-service"
     consumer_name: str = os.environ.get("HOSTNAME", "service-1")
     # Alerting: set one. Silent if none is set (by design - no fake confidence).
@@ -14,6 +15,8 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     dead_after_seconds: int = 120
+    # Events older than this are deleted hourly. Matches the longest /api/summary window.
+    retention_days: int = 90
     timezone: str = "Asia/Jakarta"
 
 settings = Settings()

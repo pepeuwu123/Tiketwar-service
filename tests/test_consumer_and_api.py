@@ -119,11 +119,53 @@ def test_healthz_reports_healthy_poll_separately(session, monkeypatch):
 
     r = fakeredis.FakeRedis(decode_responses=True)
     r.set("tiketwar:heartbeat", json.dumps({"ts": time.time(), "ok": True, "state": {"seats": 1}}))
+    r.set("tiketwar:consumer_heartbeat", json.dumps({"ts": time.time()}))
     monkeypatch.setattr(events, "connect", lambda _s=None: r)
 
     body = TestClient(api.app).get("/healthz").json()
     assert body["scraper_alive"] is True and body["last_poll_ok"] is True
+    assert body["consumer_alive"] is True
     assert body["status"] == "ok"
+
+def test_healthz_is_degraded_when_the_consumer_is_dead(session, monkeypatch):
+    """Scraper fine, consumer dead: events pile up in redis and never reach the
+    dashboard. This used to report "ok", so the watchdog stayed silent."""
+    import fakeredis
+    from app import api, events
+
+    r = fakeredis.FakeRedis(decode_responses=True)
+    r.set("tiketwar:heartbeat", json.dumps({"ts": time.time(), "ok": True, "state": None}))
+    monkeypatch.setattr(events, "connect", lambda _s=None: r)
+
+    body = TestClient(api.app).get("/healthz").json()
+    assert body["scraper_alive"] is True
+    assert body["consumer_alive"] is False
+    assert body["status"] == "degraded"
+
+def test_consume_once_beats_even_when_idle(session, monkeypatch):
+    import fakeredis
+    import redis as redis_lib
+    from app import consumer
+
+    r = fakeredis.FakeRedis(decode_responses=True)
+    def raise_timeout(*a, **kw):
+        raise redis_lib.exceptions.TimeoutError("timed out")
+    monkeypatch.setattr(r, "xreadgroup", raise_timeout)
+    monkeypatch.setattr(consumer.alerts, "check_heartbeat", lambda *a: None)
+    consumer.consume_once(r, session_factory=lambda: session.__class__(bind=session.get_bind()))
+    assert 0 < r.ttl("tiketwar:consumer_heartbeat") <= 120
+
+def test_prune_deletes_only_events_past_retention(session, monkeypatch):
+    """~6M rows a year accumulated with nothing ever reading the old ones."""
+    from app import consumer
+    monkeypatch.setattr(consumer.alerts, "on_event", lambda db, ev: None)
+    now = time.time()
+    consumer.handle(session, None, "old-0", {"type": "check", "ts": now - 100 * 86400, "state": {}})
+    consumer.handle(session, None, "old-1", {"type": "check", "ts": now - 91 * 86400, "state": {}})
+    consumer.handle(session, None, "new-0", {"type": "check", "ts": now - 89 * 86400, "state": {}})
+    assert consumer.prune_old(session, 90, batch=1) == 2      # batch=1 exercises the loop
+    left = [e.stream_id for e in session.execute(select(Event)).scalars()]
+    assert left == ["new-0"]
 
 def test_consume_once_survives_an_idle_timeout(session, monkeypatch):
     """A blocking XREADGROUP with no messages raises TimeoutError. That is idle, not broken.

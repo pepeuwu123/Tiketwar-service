@@ -32,6 +32,7 @@ def healthz():
     """Answerable by a machine. This is what the external watchdog polls."""
     now = datetime.now(timezone.utc)
     hb_raw, hb_age, scraper_alive, last_poll_ok = None, None, False, None
+    consumer_alive, consumer_age = False, None
     try:
         r = events.connect()
         hb_raw = r.get(settings.heartbeat_key)
@@ -40,6 +41,12 @@ def healthz():
             hb_age = round(now.timestamp() - hb["ts"], 1)
             scraper_alive = hb_age < settings.dead_after_seconds
             last_poll_ok = hb.get("ok")
+        # A dead consumer means events pile up in redis and never reach the
+        # database: the scraper looks healthy while the dashboard goes stale.
+        chb = r.get(settings.consumer_heartbeat_key)
+        if chb:
+            consumer_age = round(now.timestamp() - json.loads(chb)["ts"], 1)
+            consumer_alive = consumer_age < settings.dead_after_seconds
     except Exception as exc:                          # noqa: BLE001
         hb_raw = f"redis error: {exc}"
 
@@ -50,11 +57,13 @@ def healthz():
     except Exception:                                 # noqa: BLE001
         db_ok = False
 
-    healthy = db_ok and scraper_alive
+    healthy = db_ok and scraper_alive and consumer_alive
     return {
         "status": "ok" if healthy else "degraded",
         "db_ok": db_ok,
         "scraper_alive": scraper_alive,
+        "consumer_alive": consumer_alive,
+        "consumer_heartbeat_age_seconds": consumer_age,
         # alive but last poll failed is a DIFFERENT problem from dead
         "last_poll_ok": last_poll_ok,
         "heartbeat_age_seconds": hb_age,
